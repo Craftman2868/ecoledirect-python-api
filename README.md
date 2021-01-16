@@ -3,19 +3,17 @@
 > Examples
 
 ```python
-from ecoledirecte import Session
+from ecoledirecte import Session # Importation du module
 
-session = Session("username", "password")
-
-for n in session.getNotes():
-    print(n)
+session = Session("username", "password") # Initialisation de la session
 ```
 
 ```python
-from ecoledirecte import Session
+for n in session.getNotes(): # Récupération et
+    print(n)                 # affichage des notes
+```
 
-session = Session("username", "password")
-
-for hw in session.getHomeworks():
-    print(hw)
+```python
+for hw in session.getHomeworks(): # Récupération et
+    print(hw)                     # Affichage des devoirs
 ```
