@@ -2,10 +2,12 @@ from json import loads, dumps
 from os import mkdir
 from os.path import exists
 from random import choice
-from typing import List, BinaryIO
+from typing import List
 from urllib.parse import urlencode
 
-from requests import post, options
+from requests import post
+
+from errors import DownloadError, LoginError, APIError
 
 
 def _toFloat(data: str):
@@ -143,7 +145,21 @@ class Person:
     def asTeacher(self):
         if self.role != "P":
             return
-        return Teacher(("M." if self.sex else "Mme") + " " + self.name + " " + self.surname)
+        return Teacher(("M." if self.sex else "Mme") + " " + self.name + " " + self.surname[0].upper() + ".")
+
+
+class Attachment:
+    def __init__(self, session, data):
+        self.session = session
+        self.id = data["id"]
+        self.name = data["libelle"]
+        self.date = data["date"]
+
+    def download(self, filename: str = None):
+        if not filename and not exists("downloads"):
+            mkdir("downloads")
+
+        return self.session.download("PIECE_JOINTE", self.id, filename or ("downloads/" + self.name))
 
 
 class Message:
@@ -158,10 +174,12 @@ class Message:
         self.from_ = Person(data["from"]["nom"], data["from"]["prenom"], data["from"]["civilite"], data["from"]["id"],
                             data["from"]["role"])
         self.folder = folder
+        self.attachements = [Attachment(self.session, f) for f in data["files"]]
 
     def _action(self, name, **kwargs):
         r = post('https://api.ecoledirecte.com/v3/eleves/' + str(self.session.id) + '/messages.awp?verbe=put',
-                 'data=' + dumps({"token": self.session.token, "ids": [self.id], "action": name, **kwargs})).text
+                 'data=' + dumps({"token": self.session.token, "ids": [self.id], "action": name, **kwargs},
+                                 ensure_ascii=False)).text
 
         r = loads(r)
 
@@ -176,7 +194,7 @@ class Message:
     def archive(self):
         self._action("archiver")
 
-    def unarchive(self):  ###################### Ne marche pas (jsp pk) ######################
+    def unarchive(self):  # ==============================[ Ne marche pas (jsp pk) ]==============================
         self._action("desarchiver")
 
     def moveTo(self, folderId):
@@ -244,15 +262,10 @@ class ClassCloudFile:
         self.folder = False
 
     def download(self, filename: str = None):
-        r = self.session.download("CLOUD", self.id)
-
-        if not exists("downloads"):
+        if not filename and not exists("downloads"):
             mkdir("downloads")
 
-        with open(filename or ("downloads/" + self.name), "wb") as f:
-            f.write(r)
-
-        return filename or ("downloads/" + self.name)
+        return self.session.download("CLOUD", self.id, filename or ("downloads/" + self.name))
 
     def getPath(self):
         return self.parent.getPath() + "\\" + self.name
@@ -272,7 +285,27 @@ class ClassCloudFolder:
         self.parent = parent
         self.folder = True
 
+    def download(self, filename: str = None):
+        if not filename and not exists("downloads"):
+            mkdir("downloads")
+
+        return self.session.download("CLOUD", self.id, filename or ("downloads/" + self.name + ".zip"))
+
     def load(self):
+        if self.isLoaded:
+            return
+        r = post('https://api.ecoledirecte.com/v3/cloud/W/' + str(self.getId()) + '.awp?' + urlencode(
+            dict(verbe="get", idFolder=self.getPath())),
+                 'data={"token": "' + self.session.token + '"}').content.decode("utf8")
+
+        data = loads(r)["data"][0]
+
+        self.children = [loadClassCloudElement(self.session, self, c) for c in data["children"]]
+        self.isLoaded = data["isLoaded"]
+
+        return self
+
+    def reload(self):
         r = post('https://api.ecoledirecte.com/v3/cloud/W/' + str(self.getId()) + '.awp?' + urlencode(
             dict(verbe="get", idFolder=self.getPath())),
                  'data={"token": "' + self.session.token + '"}').content.decode("utf8")
@@ -290,6 +323,12 @@ class ClassCloudFolder:
             if c.folder:
                 c.loadAll()
 
+    def reloadAll(self):
+        self.reload()
+        for c in self.children:
+            if c.folder:
+                c.reloadAll()
+
     def getChildByName(self, name: str):
         self.load()
         for c in self.children:
@@ -300,6 +339,8 @@ class ClassCloudFolder:
 
     def getFileByPath(self, path: str):
         self.load()
+
+        path = path.replace("\\", "/")
 
         f, *p = path.split("/")
 
@@ -316,7 +357,7 @@ class ClassCloudFolder:
         return f.getFileByPath(p)
 
     def tree(self):
-        self.loadAll()
+        self.load()
         r = {}
         for c in self.children:
             if c.folder:
@@ -377,15 +418,10 @@ class PersonalCloudFile:
         self.folder = False
 
     def download(self, filename: str = None):
-        r = self.session.download("CLOUD", self.id)
-
-        if not exists("downloads"):
+        if not filename and not exists("downloads"):
             mkdir("downloads")
 
-        with open(filename or ("downloads/" + self.name), "wb") as f:
-            f.write(r)
-
-        return filename or ("downloads/" + self.name)
+        return self.session.download("CLOUD", self.id, filename or ("downloads/" + self.name))
 
     def getPath(self):
         return self.parent.getPath() + "\\" + self.name
@@ -405,9 +441,27 @@ class PersonalCloudFolder:
         self.parent = parent
         self.folder = True
 
+    def download(self, filename: str = None):
+        if not filename and not exists("downloads"):
+            mkdir("downloads")
+
+        return self.session.download("CLOUD", self.id, filename or ("downloads/" + self.name + ".zip"))
+
     def load(self):
         if self.isLoaded:
             return
+        r = post('https://api.ecoledirecte.com/v3/cloud/E/' + str(self.session.id) + '.awp?' + urlencode(
+            dict(verbe="get", idFolder=self.getPath())),
+                 'data={"token": "' + self.session.token + '"}').content.decode("utf8")
+
+        data = loads(r)["data"][0]
+
+        self.children = [loadPersonalCloudElement(self.session, self, c) for c in data["children"]]
+        self.isLoaded = data["isLoaded"]
+
+        return self
+
+    def reload(self):
         r = post('https://api.ecoledirecte.com/v3/cloud/E/' + str(self.session.id) + '.awp?' + urlencode(
             dict(verbe="get", idFolder=self.getPath())),
                  'data={"token": "' + self.session.token + '"}').content.decode("utf8")
@@ -425,6 +479,12 @@ class PersonalCloudFolder:
             if c.folder:
                 c.loadAll()
 
+    def reloadAll(self):
+        self.reload()
+        for c in self.children:
+            if c.folder:
+                c.reloadAll()
+
     def getChildByName(self, name: str):
         self.load()
         for c in self.children:
@@ -435,6 +495,8 @@ class PersonalCloudFolder:
 
     def getFileByPath(self, path: str):
         self.load()
+
+        path = path.replace("\\", "/")
 
         f, *p = path.split("/")
 
@@ -471,6 +533,9 @@ class PersonalCloud(PersonalCloudFolder):
     def __init__(self, session, data):
         super().__init__(session, None, data[0])
 
+    def download(self, filename: str = None):
+        raise DownloadError("Can't download all the cloud")
+
     def getPath(self):
         return ""
 
@@ -484,18 +549,58 @@ class Document:
         self.session = session
 
     def download(self, filename: str = None):
-        r = self.session.download(self.type, self.id)
-
-        if not exists("downloads"):
+        if not filename and not exists("downloads"):
             mkdir("downloads")
 
-        with open(filename or ("downloads/" + self.name + ".pdf"), "wb") as f:
-            f.write(r)
-
-        return filename or ("downloads/" + self.name + ".pdf")
+        return self.session.download(self.type, self.id, filename or ("downloads/" + self.name + ".pdf"))
 
     def __repr__(self):
         return f"<{self.__module__}.{self.__class__.__name__} '{self.name}'>"
+
+
+class Retard:
+    def __init__(self, data):
+        self.id = data["id"]
+        self.justified = data["justifie"]
+        self.motif = data["motif"] if self.justified else None
+        self.duration = data["libelle"]
+        self.date = data["date"]
+        self.comment = data["commentaire"] or None
+
+
+class Absence:
+    def __init__(self, data):
+        self.id = data["id"]
+        self.justified = data["justifie"]
+        self.motif = data["motif"] if self.justified else None
+        self.duration = data["libelle"]
+        self.date = data["date"]
+        self.comment = data["commentaire"] or None
+
+
+class CompteLog:
+    def __init__(self, data):
+        self.date = data["date"]
+        self.money = data["montant"]
+        self.name = data["libelle"]
+
+    def __repr__(self):
+        return f"<{self.__module__}.{self.__class__.__name__} {self.name} ({float(self.money):.2f}euro)>"
+
+
+class Compte:
+    def __init__(self, data):
+        self.id = data["id"]
+        self.money = data["solde"]
+        self.name = data["libelle"].strip()
+        self.logs = []
+
+        for l in data["ecritures"]:
+            if "ecritures" not in l:
+                self.logs.append(CompteLog(l))
+            else:
+                for l2 in l["ecritures"]:
+                    self.logs.append(CompteLog(l2))
 
 
 class Session:
@@ -504,38 +609,80 @@ class Session:
                  'data={"identifiant": "' + username + '","motdepasse": "' + password + '"}').text
         r = loads(r)
 
+        if r["code"] == 505:
+            raise LoginError("Invalid username or password")
+
         self.token = r["token"]
-        self.id = r["data"]["accounts"][0]["id"]
 
-    def download(self, type, id):
-        return post('https://api.ecoledirecte.com/v3/telechargement.awp?verbe=get',
-                    'token=' + self.token + '&leTypeDeFichier='+type+'&' + 'fichierId=' + str(id)).content
+        data = r["data"]["accounts"][0]
 
-    def getHomeworks(self):
-        r = post('https://api.ecoledirecte.com/v3/Eleves/' + str(self.id) + '/cahierdetexte.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
+        self.id = data["id"]
+        self.name = data["nom"]
+        self.surname = data["prenom"]
+        self.username = data["identifiant"]
+        self.currentSchoolYear = data["anneeScolaireCourante"]
+        self.loginId = data["idLogin"]
+        self.lastConnection = data["lastConnexion"]
+
+        profile = data["profile"]
+
+        self.sex = profile["sexe"] == "M"
+        self.photoURL = profile["photo"]
+        self.classId = profile["classe"]["id"]
+        self.classCode = profile["classe"]["code"]
+        self.className = profile["classe"]["libelle"]
+
+    def _request(self, url, data):
+        r = post(url, data).content.decode("utf8")
+
         r = loads(r)
 
+        if r.get("message"):
+            raise APIError(r["message"])
+
+        return r["data"]
+
+    def _download(self, type, id):
+        return post('https://api.ecoledirecte.com/v3/telechargement.awp?verbe=get',
+                    'token=' + self.token + '&leTypeDeFichier=' + type + '&' + 'fichierId=' + str(id)).content
+
+    def download(self, type, id, filename):
+        r = self._download(type, id)
+
+        with open(filename, "wb") as f:
+            f.write(r)
+
+        return filename
+
+    def getHomeworks(self):
+        r = self._request('https://api.ecoledirecte.com/v3/Eleves/' + str(self.id) + '/cahierdetexte.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
+
         result = []
-        for date, hws in r["data"].items():
+        for date, hws in r.items():
             for hw in hws:
                 result.append(Homework(date, hw))
 
         return result
 
     def getHomeworksForDay(self, day):
-        r = post('https://api.ecoledirecte.com/v3/Eleves/' + str(self.id) + '/cahierdetexte/' + day + '.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
+        r = self._request(
+            'https://api.ecoledirecte.com/v3/Eleves/' + str(self.id) + '/cahierdetexte/' + day + '.awp?verbe=get',
+            'data={"token": "' + self.token + '"}')
+
+        result = []
+        for date, hws in r.items():
+            for hw in hws:
+                result.append(Homework(date, hw))
 
         return r
 
     def getNotes(self):
-        r = post('https://api.ecoledirecte.com/v3/eleves/' + str(self.id) + '/notes.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
-        r = loads(r)
+        r = self._request('https://api.ecoledirecte.com/v3/eleves/' + str(self.id) + '/notes.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
 
         result = []
-        for p in r["data"]["periodes"]:
+        for p in r["periodes"]:
             p = Period(p)
             for n in p.data:
                 result.append(Note(n, p))
@@ -543,54 +690,50 @@ class Session:
         return NoteList(result)
 
     def getMessages(self):
-        r = post('https://api.ecoledirecte.com/v3/eleves/' + str(
+        r = self._request('https://api.ecoledirecte.com/v3/eleves/' + str(
             self.id) + '/messages.awp?verbe=getall&orderBy=date&order=desc',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
-        r = loads(r)
+                          'data={"token": "' + self.token + '"}')
 
-        data = r["data"]["messages"]
+        data = r["messages"]
 
         return MessageList(self, data)
 
     def getPersonalCloud(self):
-        r = post('https://api.ecoledirecte.com/v3/cloud/E/' + str(self.id) + '.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
-        r = loads(r)
+        r = self._request('https://api.ecoledirecte.com/v3/cloud/E/' + str(self.id) + '.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
 
-        data = r["data"]
-
-        return PersonalCloud(self, data)
+        return PersonalCloud(self, r)
 
     def getClouds(self):
-        r = post('https://api.ecoledirecte.com/v3/E/' + str(self.id) + '/espacestravail.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
-        r = loads(r)
+        r = self._request('https://api.ecoledirecte.com/v3/E/' + str(self.id) + '/espacestravail.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
 
-        data = r["data"]
-
-        return [MetaClassCloud(self, c) for c in data if c["cloud"]]
+        return [MetaClassCloud(self, c) for c in r if c["cloud"]]
 
     def getCloud(self, id: int):
-        r = post('https://api.ecoledirecte.com/v3/cloud/W/' + str(id) + '.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
+        r = self._request('https://api.ecoledirecte.com/v3/cloud/W/' + str(id) + '.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
 
-        r = loads(r)
-
-        data = r["data"]
-
-        return ClassCloud(self, id, data)
+        return ClassCloud(self, id, r)
 
     def getDocuments(self):
-        r = post('https://api.ecoledirecte.com/v3/elevesDocuments.awp?verbe=get',
-                 'data={"token": "' + self.token + '"}').content.decode("utf8")
-
-        r = loads(r)
-
-        data = r["data"]
+        r = self._request('https://api.ecoledirecte.com/v3/elevesDocuments.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
 
         return {
-            "administrative": [Document(self, d) for d in data["administratifs"]],
-            "schoolLife": [Document(self, d) for d in data["viescolaire"]],
-            "notes": [Document(self, d) for d in data["notes"]]
+            "administrative": [Document(self, d) for d in r["administratifs"]],
+            "schoolLife": [Document(self, d) for d in r["viescolaire"]],
+            "notes": [Document(self, d) for d in r["notes"]]
         }
 
+    def getSchoolLife(self):
+        r = self._request('https://api.ecoledirecte.com/v3/eleves/' + str(self.id) + '/viescolaire.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
+
+        return [Absence(data) if data["typeElement"] else Retard(data) for data in r["absencesRetards"]]
+
+    def getMoneyData(self):
+        r = self._request('https://api.ecoledirecte.com/v3/comptes/detail.awp?verbe=get',
+                          'data={"token": "' + self.token + '"}')
+
+        return [Compte(c) for c in r["comptes"]]
